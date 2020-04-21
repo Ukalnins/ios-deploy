@@ -90,6 +90,8 @@ char const*upload_pathname = NULL;
 char *bundle_id = NULL;
 bool interactive = true;
 bool justlaunch = false;
+bool file_system = false;
+bool non_recursively = false;
 char *app_path = NULL;
 char *app_deltas = NULL;
 char *device_id = NULL;
@@ -99,6 +101,7 @@ char *list_root = NULL;
 int _timeout = 0;
 int _detectDeadlockTimeout = 0;
 bool _json_output = false;
+NSMutableArray *_file_meta_info = nil;
 int port = 0;    // 0 means "dynamically assigned"
 CFStringRef last_path = NULL;
 service_conn_t gdbfd;
@@ -663,33 +666,36 @@ mach_error_t install_callback(CFDictionaryRef dict, int arg) {
     CFNumberGetValue(CFDictionaryGetValue(dict, CFSTR("PercentComplete")), kCFNumberSInt32Type, &percent);
 
     int overall_percent = (percent / 2) + 50;
-
-    // During standard install, the "Status" value contains the actual status,
-    // such as "Copying" or "CreatingStagingDirectory", as well as any
-    // applicable paths. The incremental install version, includes only the
-    // status and a seperate value in "Path" for any applicable paths. This
-    // merges the status and path during incremental installs so the output is
-    // similar between both installation types.
-    CFStringRef path = CFDictionaryGetValue(dict, CFSTR("Path"));
-    NSString *status_with_path = (path != NULL && app_deltas != NULL) ?
-      [NSString stringWithFormat:@"%@ %@", status, path] :
-      (__bridge NSString *)status;
-
-    NSLogOut(@"[%3d%%] %@", overall_percent, status_with_path);
-
-    NSMutableDictionary *jsonOutput = [@{
-      @"Event": @"BundleInstall",
-      @"OverallPercent": @(overall_percent),
-      @"Percent": @(percent),
-      @"Status": (__bridge NSString *)status
-    } mutableCopy];
-    if (path != NULL) {
-      [jsonOutput setValue:(__bridge NSString *)path forKey:@"Path"];
-    }
-
-    NSLogJSON(jsonOutput);
-    [jsonOutput release];
+    NSLogOut(@"[%3d%%] %@", overall_percent, status);
+    NSLogJSON(@{@"Event": @"BundleInstall",
+                @"OverallPercent": @(overall_percent),
+                @"Percent": @(percent),
+                @"Status": (__bridge NSString *)status
+                });
     return 0;
+}
+
+// During standard installation transferring and installation takes place
+// in distinct function that can be passed distinct callbacks. Incremental
+// installation performs both transfer and installation in a single function so
+// use this callback to determine which step is occuring and call the proper
+// callback.
+mach_error_t incremental_install_callback(CFDictionaryRef dict, int arg) {
+  CFStringRef status = CFDictionaryGetValue(dict, CFSTR("Status"));
+  if (CFEqual(status, CFSTR("TransferringPackage"))) {
+    int percent;
+    CFNumberGetValue(CFDictionaryGetValue(dict, CFSTR("PercentComplete")), kCFNumberSInt32Type, &percent);
+    int overall_percent = (percent / 2);
+    NSLogOut(@"[%3d%%] %@", overall_percent, status);
+    NSLogJSON(@{@"Event": @"TransferringPackage",
+                @"OverallPercent": @(overall_percent),
+    });
+    return 0;
+  } else if (CFEqual(status, CFSTR("CopyingFile"))) {
+    return transfer_callback(dict, arg);
+  } else {
+    return install_callback(dict, arg);
+  }
 }
 
 CFURLRef copy_device_app_url(AMDeviceRef device, CFStringRef identifier) {
@@ -1296,15 +1302,48 @@ void read_dir(AFCConnectionRef afc_conn_p, const char* dir,
         // there was a problem reading or opening the file to get info on it, abort
         return;
     }
-
+    
+    long long mtime = -1;
+    long long birthtime = -1;
+    long size = -1;
+    long blocks = -1;
+    long nlink = -1;
+    NSString * ifmt = nil;
     while((AFCKeyValueRead(afc_dict_p,&key,&val) == 0) && key && val) {
         if (strcmp(key,"st_ifmt")==0) {
             not_dir = strcmp(val,"S_IFDIR");
-            break;
+            if (_json_output) {
+                ifmt = [NSString stringWithUTF8String:val];
+            } else {
+                break;
+            }
+        } else if (strcmp(key, "st_size") == 0) {
+            size = atol(val);
+        } else if (strcmp(key, "st_mtime") == 0) {
+            mtime = atoll(val);
+        } else if (strcmp(key, "st_birthtime") == 0) {
+            birthtime = atoll(val);
+        } else if (strcmp(key, "st_nlink") == 0) {
+            nlink = atol(val);
+        } else if (strcmp(key, "st_blocks") == 0) {
+            nlink = atol(val);
         }
     }
     AFCKeyValueClose(afc_dict_p);
-
+    
+    if (_json_output) {
+        if (_file_meta_info == nil) {
+            _file_meta_info = [[NSMutableArray alloc] init];
+        }
+        [_file_meta_info addObject: @{@"full_path": [NSString stringWithUTF8String:dir],
+                                      @"st_ifmt": ifmt,
+                                      @"st_nlink": @(nlink),
+                                      @"st_size": @(size),
+                                      @"st_blocks": @(blocks),
+                                      @"st_mtime": @(mtime),
+                                      @"st_birthtime": @(birthtime)}];
+    }
+    
     if (not_dir) {
         if (callback) (*callback)(afc_conn_p, dir, READ_DIR_FILE);
         return;
@@ -1338,7 +1377,9 @@ void read_dir(AFCConnectionRef afc_conn_p, const char* dir,
         if (dir_joined[strlen(dir)-1] != '/')
             strcat(dir_joined, "/");
         strcat(dir_joined, dir_ent);
-        read_dir(afc_conn_p, dir_joined, callback);
+        if (!(non_recursively && strcmp(list_root, dir) != 0)) {
+            read_dir(afc_conn_p, dir_joined, callback);
+        }
         free(dir_joined);
     }
 
@@ -1350,6 +1391,26 @@ void read_dir(AFCConnectionRef afc_conn_p, const char* dir,
     if (callback) (*callback)(afc_conn_p, dir, READ_DIR_AFTER_DIR);
 }
 
+AFCConnectionRef start_afc_service(AMDeviceRef device) {
+    AMDeviceConnect(device);
+    assert(AMDeviceIsPaired(device));
+    check_error(AMDeviceValidatePairing(device));
+    check_error(AMDeviceStartSession(device));
+
+    AFCConnectionRef conn = NULL;
+    service_conn_t serviceConn;
+
+    if (AMDeviceStartService(device, AMSVC_AFC, &serviceConn, 0) != MDERR_OK) {
+        on_error(@"Unable to start file service!");
+    }
+    if (AFCConnectionOpen(serviceConn, 0, &conn) != MDERR_OK) {
+        on_error(@"Unable to open connection!");
+    }
+
+    check_error(AMDeviceStopSession(device));
+    check_error(AMDeviceDisconnect(device));
+    return conn;
+}
 
 // Used to send files to app-specific sandbox (Documents dir)
 AFCConnectionRef start_house_arrest_service(AMDeviceRef device) {
@@ -1448,9 +1509,21 @@ void list_files_callback(AFCConnectionRef conn, const char *name, read_dir_cb_re
 
 void list_files(AMDeviceRef device)
 {
-    AFCConnectionRef afc_conn_p = start_house_arrest_service(device);
+    AFCConnectionRef afc_conn_p;
+    if (file_system) {
+        afc_conn_p = start_afc_service(device);
+    } else {
+        afc_conn_p = start_house_arrest_service(device);
+    }
     assert(afc_conn_p);
-    read_dir(afc_conn_p, list_root?list_root:"/", list_files_callback);
+    if (_json_output) {
+        read_dir(afc_conn_p, list_root?list_root:"/", NULL);
+        NSLogJSON(@{@"Event": @"FileListed",
+                    @"Files": _file_meta_info});
+    } else {
+        read_dir(afc_conn_p, list_root?list_root:"/", list_files_callback);
+    }
+    
     check_error(AFCConnectionClose(afc_conn_p));
 }
 
@@ -1507,18 +1580,28 @@ void list_bundle_id(AMDeviceRef device)
     check_error(AMDeviceValidatePairing(device));
     check_error(AMDeviceStartSession(device));
 
-    NSArray *a = [NSArray arrayWithObjects:@"CFBundleIdentifier", nil];
+    NSArray *a = [NSArray arrayWithObjects:
+                  @"CFBundleIdentifier",
+                  @"CFBundleName",
+                  @"CFBundleDisplayName",
+                  @"CFBundleVersion",
+                  @"CFBundleShortVersionString", nil];
     NSDictionary *optionsDict = [NSDictionary dictionaryWithObject:a forKey:@"ReturnAttributes"];
     CFDictionaryRef options = (CFDictionaryRef)optionsDict;
     CFDictionaryRef result = nil;
     check_error(AMDeviceLookupApplications(device, options, &result));
 
-    CFIndex count;
-    count = CFDictionaryGetCount(result);
-    const void *keys[count];
-    CFDictionaryGetKeysAndValues(result, keys, NULL);
-    for(int i = 0; i < count; ++i) {
-        NSLogOut(@"%@", (CFStringRef)keys[i]);
+    if (_json_output) {
+        NSLogJSON(@{@"Event": @"ListBundleId",
+                    @"Apps": (NSDictionary *)result});
+    } else {
+        CFIndex count;
+        count = CFDictionaryGetCount(result);
+        const void *keys[count];
+        CFDictionaryGetKeysAndValues(result, keys, NULL);
+        for(int i = 0; i < count; ++i) {
+            NSLogOut(@"%@", (CFStringRef)keys[i]);
+        }
     }
 
     check_error(AMDeviceStopSession(device));
@@ -1573,7 +1656,13 @@ void copy_file_callback(AFCConnectionRef afc_conn_p, const char *name, read_dir_
 
 void download_tree(AMDeviceRef device)
 {
-    AFCConnectionRef afc_conn_p = start_house_arrest_service(device);
+    AFCConnectionRef afc_conn_p;
+    if (file_system) {
+        afc_conn_p = start_afc_service(device);
+    } else {
+        afc_conn_p = start_house_arrest_service(device);
+    }
+    
     assert(afc_conn_p);
     char *dirname = NULL;
 
@@ -1608,7 +1697,12 @@ void upload_single_file(AMDeviceRef device, AFCConnectionRef afc_conn_p, NSStrin
 
 void upload_file(AMDeviceRef device)
 {
-    AFCConnectionRef afc_conn_p = start_house_arrest_service(device);
+    AFCConnectionRef afc_conn_p;
+    if (file_system) {
+        afc_conn_p = start_afc_service(device);
+    } else {
+        afc_conn_p = start_house_arrest_service(device);
+    } 
     assert(afc_conn_p);
 
     if (!target_filename)
@@ -1690,14 +1784,24 @@ void upload_dir(AMDeviceRef device, AFCConnectionRef afc_conn_p, NSString* sourc
 }
 
 void make_directory(AMDeviceRef device) {
-    AFCConnectionRef afc_conn_p = start_house_arrest_service(device);
+    AFCConnectionRef afc_conn_p;
+    if (file_system) {
+        afc_conn_p = start_afc_service(device);
+    } else {
+        afc_conn_p = start_house_arrest_service(device);
+    }
     assert(afc_conn_p);
     check_error(AFCDirectoryCreate(afc_conn_p, target_filename));
     check_error(AFCConnectionClose(afc_conn_p));
 }
 
 void remove_path(AMDeviceRef device) {
-    AFCConnectionRef afc_conn_p = start_house_arrest_service(device);
+    AFCConnectionRef afc_conn_p;
+    if (file_system) {
+        afc_conn_p = start_afc_service(device);
+    } else {
+        afc_conn_p = start_house_arrest_service(device);
+    }
     assert(afc_conn_p);
     check_error(AFCRemovePath(afc_conn_p, target_filename));
     check_error(AFCConnectionClose(afc_conn_p));
@@ -1932,7 +2036,7 @@ void handle_device(AMDeviceRef device) {
           assert(AMDeviceIsPaired(device));
           check_error(AMDeviceValidatePairing(device));
           check_error(AMDeviceStartSession(device));
-          check_error(AMDeviceSecureInstallApplicationBundle(device, url, options, install_callback, 0));
+          check_error(AMDeviceSecureInstallApplicationBundle(device, url, options, incremental_install_callback, 0));
           CFRelease(extracted_bundle_id);
           CFRelease(deltas_path);
           CFRelease(deltas_relative_url);
@@ -2064,6 +2168,8 @@ void usage(const char* app) {
         @"  -O, --output <file>          write stdout to this file\n"
         @"  -E, --error_output <file>    write stderr to this file\n"
         @"  --detect_deadlocks <sec>     start printing backtraces for all threads periodically after specific amount of seconds\n"
+        @"  -f, --file_system            specify file system for mkdir / list / upload / download / rm\n"
+        @"  -F, --non-recursively        specify non-recursively walk directory\n"
         @"  -j, --json                   format output as JSON\n",
         [NSString stringWithUTF8String:app]);
 }
@@ -2118,11 +2224,13 @@ int main(int argc, char *argv[]) {
         { "detect_deadlocks", required_argument, NULL, 1000 },
         { "json", no_argument, NULL, 'j'},
         { "app_deltas", required_argument, NULL, 'A'},
+        { "file_system", no_argument, NULL, 'f'},
+        { "non-recursively", no_argument, NULL, 'F'},
         { NULL, 0, NULL, 0 },
     };
     int ch;
 
-    while ((ch = getopt_long(argc, argv, "VmcdvunrILeD:R:X:i:b:a:t:p:1:2:o:l:w:9BWjNs:OE:CA:", longopts, NULL)) != -1)
+    while ((ch = getopt_long(argc, argv, "VmcdvunrILefFD:R:X:i:b:a:t:p:1:2:o:l:w:9BWjNs:OE:CA:", longopts, NULL)) != -1)
     {
         switch (ch) {
         case 'm':
@@ -2251,6 +2359,12 @@ int main(int argc, char *argv[]) {
             break;
         case 'A':
             app_deltas = resolve_path(optarg);
+            break;
+        case 'f':
+            file_system = true;
+            break;
+        case 'F':
+            non_recursively = true;
             break;
         default:
             usage(argv[0]);
