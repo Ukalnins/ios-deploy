@@ -37,6 +37,7 @@
     target modules search-paths add {modules_search_paths_pairs}\n\
     command script import \"{python_file_path}\"\n\
     command script add -f {python_command}.connect_command connect\n\
+    command script add -f {python_command}.cleanup_command cleanup\n\ 
     command script add -s asynchronous -f {python_command}.run_command run\n\
     command script add -s asynchronous -f {python_command}.autoexit_command autoexit\n\
     command script add -s asynchronous -f {python_command}.safequit_command safequit\n\
